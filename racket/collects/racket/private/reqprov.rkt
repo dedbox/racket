@@ -1,6 +1,7 @@
 (module reqprov '#%kernel
   (#%require "define.rkt"
              (for-syntax '#%kernel
+                         "define.rkt"
                          "stx.rkt" "stxcase-scheme.rkt" "small-scheme.rkt" 
                          "stxloc.rkt" "qqstx.rkt" "more-scheme.rkt"
                          "member.rkt"
@@ -976,118 +977,120 @@
      id))
 
   (define-syntax struct-out
-    (make-provide-transformer
-     (lambda (stx modes)
-       (unless (or (null? modes)
-                   (equal? '(0) modes))
-         (raise-syntax-error
-          #f
-          "allowed only for relative phase level 0"
-          stx))
-       (syntax-case stx ()
-         [(_ id)
-          (let ([id #'id])
-            (unless (identifier? id)
-              (raise-syntax-error
-               #f
-               "expected an identifier for a struct-type name, but found something else"
-               stx
-               id))
-            (let ([v (syntax-local-value id (lambda () #f))])
+    (let ()
+      (define (raise-wrong-phase-level-syntax-error stx)
+        (raise-syntax-error #f "allowed only for relative phase level 0" stx))
+
+      (define (raise-name-not-an-identifier-syntax-error stx id)
+        (raise-syntax-error
+         #f (string-append "expected an identifier for a struct-type name, "
+                           "but found something else")
+         stx id))
+
+      (define (raise-bindings-syntax-error stx id ids)
+        (raise-syntax-error
+         #f (if (null? ids)
+                "no binding or structure-type identifier"
+                (format (string-append "multiple bindings (~a~a~a~a) "
+                                       "for structure-type identifier")
+                        (syntax-e (car ids))
+                        (if (null? (cddr ids)) " and " ", ")
+                        (syntax-e (car ids))
+                        (if (null? (cddr ids)) "" ", ...")))
+         stx id))
+
+      (define (raise-not-struct-type-syntax-error stx id)
+        (raise-syntax-error
+         #f "identifier is not bound to struct type information"
+         stx id))
+
+      (define (extract-super-struct-info v)
+        (define super-id (list-ref v 5))
+        (define super-v
+          (and (identifier? super-id)
+               (syntax-local-value super-id (lambda () #f))))
+        (and (struct-info? super-v)
+             (extract-struct-info super-v)))
+
+      (define (non-super-ids super-ids ids)
+        (define (arrived-at-super-ids? ids)
+          (and (pair? super-ids)
+               (car ids)
+               (free-identifier=? (car ids) (car super-ids))))
+        (cond
+          [(or (not (pair? ids)) (arrived-at-super-ids? ids)) null]
+          [else (cons (car ids) (non-super-ids super-ids (cdr ids)))]))
+
+      (define (non-false-elements vs)
+        (filter values vs))
+
+      (define (list-ize ids super-ids)
+        (non-super-ids (and super-ids (non-false-elements super-ids)) ids))
+
+      ;; FIXME: we're building a list of all imports on every expansion
+      ;; of `struct-out'. That could become expensive if `struct-out' is
+      ;; used a lot.
+      (define (make-avail-ids)
+        (define defined-ids
+          (hash-ref (syntax-local-module-defined-identifiers)
+                    (syntax-local-phase-level)
+                    null))
+        (define required-ids
+          (let ([idss (syntax-local-module-required-identifiers #f #t)])
+            (if idss
+                (let ([a (assoc (syntax-local-phase-level) idss)])
+                  (if a (cdr a) null))
+                null)))
+        (append defined-ids required-ids))
+
+      (define (make-exports stx struct-info-id v)
+        (define super-v (extract-super-struct-info v))
+        (define avail-ids (make-avail-ids))
+        (define (find-imported/defined id)
+          (define (same-as-id? id2)
+            (and (free-identifier=? id2 id)))
+          (define ids (filter same-as-id? avail-ids))
+          (if (or (null? ids) (pair? (cdr ids)))
+              (raise-bindings-syntax-error stx id ids)
+              (car ids)))
+        (define (id->export id)
+          (and id (let ([id (find-imported/defined id)])
+                    (make-export id (syntax-e id) 0 #f id))))
+        (non-false-elements
+         (map
+          id->export
+          (append
+           (list struct-info-id (list-ref v 0) (list-ref v 1) (list-ref v 2))
+           (list-ize (list-ref v 3) (and super-v (list-ref super-v 3)))
+           (list-ize (list-ref v 4) (and super-v (list-ref super-v 3)))))))
+
+      (define (struct-info-identifier? id)
+        (and (identifier? id)
+             (struct-info? (syntax-local-value id (lambda () #f)))))
+
+      (define (disappeared-use-property id)
+        (syntax-property #'(void) 'disappeared-use (syntax-local-introduce #'id)))
+
+      (make-provide-transformer
+       (lambda (stx modes)
+         (unless (or (null? modes) (equal? '(0) modes))
+           (raise-wrong-phase-level-syntax-error stx))
+         (syntax-case stx ()
+           [(_ id)
+            (let ([id #'id])
+              (unless (identifier? id)
+                (raise-name-not-an-identifier-syntax-error stx id))
+              (define v (syntax-local-value id (lambda () #f)))
               (if (struct-info? v)
-                  (let* ([v (extract-struct-info v)]
-                         [super-v (let ([super-id (list-ref v 5)])
-                                    (and (identifier? super-id)
-                                         (let ([super-v (syntax-local-value super-id (lambda () #f))])
-                                           (and (struct-info? super-v)
-                                                (extract-struct-info super-v)))))]
-                         [list-ize (lambda (ids super-ids)
-                                     (let ((super-ids (and super-ids (filter values super-ids))))
-                                       ;Remove all unknown super-ids
-                                       (let loop ([ids ids])
-                                        (cond
-                                         [(not (pair? ids)) null]
-                                         [(and (pair? super-ids)
-                                               (car ids)
-                                               (free-identifier=? (car ids)
-                                                                  (car super-ids)))
-                                          ;; stop because we got to ids that belong to the supertype
-                                          null]
-                                         [else (cons (car ids) (loop (cdr ids)))]))))]
-                         ;; FIXME: we're building a list of all imports on every expansion
-                         ;; of `struct-out'. That could become expensive if `struct-out' is
-                         ;; used a lot.
-                         [avail-ids (append (hash-ref (syntax-local-module-defined-identifiers)
-                                                      (syntax-local-phase-level)
-                                                      null)
-                                            (let ([idss (syntax-local-module-required-identifiers #f #t)])
-                                              (if idss
-                                                  (let ([a (assoc (syntax-local-phase-level) idss)])
-                                                    (if a
-                                                        (cdr a)
-                                                        null))
-                                                  null)))]
-                         [find-imported/defined (lambda (id)
-                                                  (let ([ids (filter (lambda (id2)
-                                                                       (and (free-identifier=? id2 id)
-                                                                            id2))
-                                                                     avail-ids)])
-                                                    (cond
-                                                     [(or (null? ids)
-                                                          (pair? (cdr ids)))
-                                                      (raise-syntax-error
-                                                       #f
-                                                       (if (null? ids)
-                                                           "no binding for structure-type identifier"
-                                                           (format "multiple bindings (~a~a~a~a) for structure-type identifier"
-                                                                   (syntax-e (car ids))
-                                                                   (if (null? (cddr ids))
-                                                                       " and "
-                                                                       ", ")
-                                                                   (syntax-e (cadr ids))
-                                                                   (if (null? (cddr ids))
-                                                                       ""
-                                                                       ", ...")))
-                                                       stx
-                                                       id)]
-                                                     [else (car ids)])))])
-                    (filter
-                     values
-                     (map (lambda (id)
-                            (and id
-                                 (let ([id (find-imported/defined id)])
-                                   (make-export id
-                                                (syntax-e id)
-                                                0
-                                                #f
-                                                id))))
-                          (append
-                           (list id
-                                 (list-ref v 0)
-                                 (list-ref v 1)
-                                 (list-ref v 2))
-                           (list-ize (list-ref v 3)
-                                     (and super-v
-                                          (list-ref super-v 3)))
-                           (list-ize (list-ref v 4)
-                                     (and super-v
-                                          (list-ref super-v 3)))))))
-                  (raise-syntax-error
-                   #f
-                   "identifier is not bound to struct type information"
-                   stx
-                   id))))]))
-     (λ (stx modes)
-       (syntax-case stx ()
-         [(_ id)
-          (and (identifier? #'id)
-               (struct-info? (syntax-local-value #'id (lambda () #f))))
-          (syntax-local-lift-expression
-           (syntax-property #'(void)
-                            'disappeared-use
-                            (syntax-local-introduce #'id)))]
-         [whatevs (void)])
-       stx)))
+                  (make-exports stx id (extract-struct-info v))
+                  (raise-not-struct-type-syntax-error stx id)))]))
+       (lambda (stx modes)
+         (syntax-case stx ()
+           [(_ id)
+            (struct-info-identifier? #'id)
+            (syntax-local-lift-expression (disappeared-use-property #'id))]
+           [_ (void)])
+         stx))))
 
   (define-syntax combine-out
     (make-provide-transformer
